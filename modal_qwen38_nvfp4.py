@@ -32,6 +32,7 @@ Design (carries the lessons from the HyperQwen deployment, same day):
 Runbook: see README.md in this directory.
 """
 
+import json
 import os
 import subprocess
 import time
@@ -44,8 +45,8 @@ REPO_ID = "Vtuber-plan/Huihui-Qwen3.8-27B-abliterated-NVFP4"
 MODEL_DIR = "/hf-cache/models/Huihui-Qwen3.8-27B-abliterated-NVFP4"
 SERVED_NAME = "qwen3.8-27b-abliterated-nvfp4"
 PORT = 8000
-MAX_MODEL_LEN = 8192
-MAX_NUM_SEQS = 16
+MAX_MODEL_LEN = 6144
+MAX_NUM_SEQS = 4
 GPU_MEM_UTIL = 0.98
 
 app = modal.App(APP_NAME)
@@ -87,7 +88,16 @@ def prepare():
     memory=16384,
     volumes={"/hf-cache": hf_volume},
     secrets=[modal.Secret.from_name("qwen38-nvfp4")],
-    env={"ENFORCE_EAGER": "1"},
+    # HQ_VARIANT selects the optimization profile (set per deploy):
+    #   base      — enforce-eager, no speculative decoding (shipped
+    #               2026-10-28 baseline; the only config that fit
+    #               before vision profiling was disabled)
+    #   graphs    — CUDA graphs on (OOM on L4: capture pool does not
+    #               fit next to 17.9 GiB of weights — dead end here)
+    #   graphs_mtp  — CUDA graphs + MTP speculative (also OOM)
+    #   mtp_eager — enforce-eager + MTP speculative decoding (the
+    #               checkpoint ships mtp.* tensors), 1 draft token
+    env={"HQ_VARIANT": "base"},
     timeout=86400,
     startup_timeout=3600,
     max_containers=1,
@@ -115,10 +125,18 @@ def serve():
         # vision input is ever wanted AND memory allows.
         "--limit-mm-per-prompt", '{"image": 0, "video": 0}',
     ]
-    if os.environ.get("ENFORCE_EAGER") == "1":
+    variant = os.environ.get("HQ_VARIANT", "base")
+    if variant in ("base", "mtp_eager"):
         args.append("--enforce-eager")
+    if variant in ("graphs_mtp", "graphs_mtp2", "mtp_eager"):
+        n = 2 if variant.endswith("mtp2") else 1
+        args += ["--speculative-config",
+                 json.dumps({"method": "mtp", "num_speculative_tokens": n})]
+    print(f"serve variant: {variant}; args: {' '.join(args)}")
     env = dict(os.environ)
     env.setdefault("VLLM_CACHE_ROOT", "/hf-cache/vllm-cache")
+    # Fragmentation headroom on the nearly-full 22.1 GiB card.
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     subprocess.Popen(args, env=env)
 
 
@@ -160,6 +178,62 @@ def ping(url: str):
             "usage": out.get("usage")}
 
 
+@app.function(image=prep_image, cpu=1, memory=1024, timeout=1800,
+              secrets=[modal.Secret.from_name("qwen38-nvfp4")])
+def bench(url: str, tokens: int = 512):
+    """Decode-speed benchmark: wait for health, warm up, then time a
+    forced-length generation (min_tokens + ignore_eos) twice and
+    report completion tok/s for the better run."""
+    key = os.environ["VLLM_API_KEY"]
+    deadline = time.time() + 1500
+    while time.time() < deadline:
+        try:
+            req = urllib.request.Request(
+                url + "/health",
+                headers={"Authorization": f"Bearer {key}"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                if r.status == 200:
+                    break
+        except Exception:  # noqa: BLE001 - not up yet
+            time.sleep(20)
+    else:
+        return {"error": "health deadline exceeded"}
+
+    def one_gen():
+        body = json.dumps({
+            "model": SERVED_NAME,
+            "messages": [{"role": "user", "content":
+                          "Write a long, detailed essay about the "
+                          "history of maritime trade in the "
+                          "Mediterranean. Keep writing until told "
+                          "to stop."}],
+            "chat_template_kwargs": {"enable_thinking": False},
+            "max_tokens": tokens, "min_tokens": tokens,
+            "ignore_eos": True, "temperature": 0.0,
+        }).encode()
+        req = urllib.request.Request(
+            url + "/v1/chat/completions", data=body, method="POST",
+            headers={"Authorization": f"Bearer {key}",
+                     "Content-Type": "application/json"})
+        t0 = time.time()
+        with urllib.request.urlopen(req, timeout=900) as r:
+            out = json.loads(r.read())
+        dt = time.time() - t0
+        n = out["usage"]["completion_tokens"]
+        return {"tokens": n, "seconds": round(dt, 2),
+                "tok_per_s": round(n / dt, 1)}
+
+    one_gen()  # warm-up (prefix cache, kernel autotune)
+    runs = [one_gen(), one_gen()]
+    best = max(runs, key=lambda x: x["tok_per_s"])
+    return {"runs": runs, "best_tok_per_s": best["tok_per_s"]}
+
+
 @app.local_entrypoint()
 def do_ping(url: str):
     print(ping.remote(url))
+
+
+@app.local_entrypoint()
+def do_bench(url: str):
+    print(bench.remote(url))

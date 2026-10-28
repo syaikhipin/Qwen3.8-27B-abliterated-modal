@@ -1,8 +1,63 @@
 # Huihui-Qwen3.8-27B-abliterated on Modal
 
-Serve the abliterated Qwen3.8-27B NVFP4 checkpoint on
-[Modal](https://modal.com) with vLLM — an OpenAI-compatible endpoint
-that scales to zero when idle.
+Serve the abliterated Qwen3.8-27B on [Modal](https://modal.com) —
+an OpenAI-compatible endpoint that scales to zero when idle.
+
+**Start with the optimized deployment** (`modal_hq_ablit.py`): the
+syv-ai HyperQwen patched-vLLM stack serving an AutoRound build of
+the abliteration at **69.2 tok/s** on an A10 — 5.4× the stock-vLLM
+NVFP4 setup on the same GPU. The stock deployment
+(`modal_qwen38_nvfp4.py`, 12.8 tok/s on A10 / 7.8 on L4) is kept
+below for reference and as a fallback.
+
+## Benchmarks (measured 2026-10-28)
+
+Forced-length generations (512 tokens, greedy, thinking off,
+best of two runs after warm-up; the `bench` function in each app):
+
+| Stack | Checkpoint | GPU | tok/s |
+|---|---|---|---|
+| HyperQwen fork, MTP spec (k=4) + CUDA graphs | ababaka AutoRound (int8 lm_head/embed/MTP, 40k draft head) | A10 | **69.2** |
+| Stock vLLM 0.31, eager, no speculation | Vtuber-plan NVFP4 (Marlin weight-only) | A10 | 12.8 |
+| Stock vLLM 0.31, eager, no speculation | Vtuber-plan NVFP4 (Marlin weight-only) | L4 | 7.8 |
+
+Why the gap: NVFP4 on sm86/sm89 has no native FP4 path in stock
+vLLM, so it dequantizes through Marlin in eager mode; speculative
+decoding is unavailable there in practice, because vLLM builds the
+MTP draft with a separate bf16 lm_head (2.37 GiB) that OOMs next to
+17.9 GiB of weights on a 22.1 GiB card, and CUDA-graph capture does
+not fit either. The fork's preparation quantizes lm_head, embed
+and MTP to int8 and builds a 40k-token draft head, which is what
+makes MTP + graphs fit — with 3.87 GiB of KV cache to spare at
+32k context (acceptance length 2.72 in the run above).
+
+## Optimized deployment (HyperQwen fork)
+
+| | |
+|---|---|
+| Model | [`ababaka/Huihui-Qwen3.8-27B-Abliterated-W4A16-AutoRound`](https://huggingface.co/ababaka/Huihui-Qwen3.8-27B-Abliterated-W4A16-AutoRound) — compressed-tensors export, already fork-prepared. (letechlead's native auto-round export does **not** work: the fork's prepare scripts extend a compressed-tensors config and refuse to convert one.) |
+| Engine | HyperQwen image `ghcr.io/syv-ai/hyperqwen:sha-ce9615c` (patched vLLM 0.31.0) |
+| GPU | Modal A10 (sm86 — the fork's 3090 tuning target; ~$1.10/hr while running, $0 idle) |
+| Served model name | `qwen3.8-27b` |
+| Context | 32,768 tokens, MTP speculative decoding, CTX=fast |
+| Modal app | `qwen38-hq-ablit` |
+
+```bash
+modal run modal_hq_ablit.py::prepare     # download + verify (~17 GB, once)
+modal deploy modal_hq_ablit.py
+modal run modal_hq_ablit.py::do_bench \
+  --url https://<your-workspace>--qwen38-hq-ablit-serve.us-east.modal.run
+```
+
+Auth reuses the `qwen38-nvfp4` Modal secret below (same API key).
+The `-fast` model variant is not built: its builder hardlinks
+files and Modal Volumes refuse hardlinks (~7% left on the table).
+
+---
+
+## Stock deployment (reference)
+
+Serve the abliterated Qwen3.8-27B NVFP4 checkpoint with vLLM.
 
 | | |
 |---|---|
@@ -92,9 +147,14 @@ these was set after a boot failed without it (all verified live on
 
 ## Files
 
-- `modal_qwen38_nvfp4.py` — the whole deployment: `prepare`
+- `modal_hq_ablit.py` — the optimized deployment (HyperQwen fork):
+  `prepare` (download the AutoRound checkpoint to the
+  `qwen38-hq-ablit-models` volume + the fork's own prepare),
+  `serve` (A10 web endpoint), `bench`/`do_bench` (tok/s harness).
+- `modal_qwen38_nvfp4.py` — the stock deployment: `prepare`
   (one-time weight download to the `qwen38-nvfp4-hf` volume),
-  `serve` (the vLLM web endpoint), `ping`/`do_ping` (smoke test).
+  `serve` (the vLLM web endpoint), `ping`/`do_ping` (smoke test),
+  `bench`/`do_bench` (the same tok/s harness).
 - The API key lives only in the Modal secret `qwen38-nvfp4`. Rotate
   it with `modal secret create qwen38-nvfp4 VLLM_API_KEY=<new> --force`
   followed by a redeploy.
