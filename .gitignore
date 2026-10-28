@@ -1,0 +1,6 @@
+# Secrets — the API key lives in the Modal secret store, never in git
+.api_key
+.curl_headers
+# Run logs and caches
+*.log
+__pycache__/
