@@ -21,8 +21,8 @@ convert one.) The fork's steps, for reference:
 GPU: A10 (sm86 — the fork's tuning target is the 3090, same arch;
 Modal has no 3090 SKU, and an A10 exposes the same 22.1 GiB as an
 L4, which is precisely the memory geometry this stack is tuned
-for). MAX_LEN starts at 32768 (the base model fit 49152 on this
-card this morning; the abliterated export is a bit larger).
+for). MAX_LEN is the model's native 262,144 since 2026-10-29
+(CTX=huge/KVarN; it was 32768 under CTX=fast at first deployment).
 
 Cost guards, as everywhere today: max_containers=1,
 scaledown_window=120. Secrets: reuses the `qwen38-nvfp4` Modal
@@ -67,7 +67,20 @@ PREPARE_ENV = {
 
 SERVE_ENV = {
     "SPEC": "mtp",
-    "CTX": "fast",
+    # CTX=huge (Julio, 2026-10-29): the model's native context,
+    # 262,144 tokens, via the fork's KVarN 4/2-bit KV cache. CTX=fast
+    # (bf16 KV) physically cannot hold 262k on a 22.1 GiB card.
+    # Trade-off (fork docs + our bench): a few tok/s at chat length,
+    # roughly half decode rate past 100k of context depth, and the
+    # KV cache is lossy-compressed instead of exact bf16.
+    "CTX": "huge",
+    # 262,144 tokens of KVarN KV needs 3.89 GiB; at the fork's
+    # default GPU_UTIL=0.93 only 2.87 GiB is left after weights,
+    # drafts and graphs on the 22.1 GiB card, and vLLM refuses to
+    # boot ("estimated maximum model length" ~193k). 0.98 leaves
+    # ~3.98 GiB — enough for exactly one full-length sequence;
+    # short chats share the pool as usual.
+    "GPU_UTIL": "0.98",
     "HOST": "0.0.0.0",
     "PORT": str(PORT),
     "MODEL": MODEL_DIR,
@@ -75,7 +88,7 @@ SERVE_ENV = {
     "FAST_VARIANT": "0",
     "DFLASH2": "0",
     "PREPARE": "0",        # prepare() below already did the work
-    "MAX_LEN": "32768",
+    "MAX_LEN": "262144",
     "HOME": "/hq-cache",
 }
 
